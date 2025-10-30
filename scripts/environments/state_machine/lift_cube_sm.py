@@ -18,6 +18,8 @@ It uses the `warp` library to run the state machine in parallel on the GPU.
 """Launch Omniverse Toolkit first."""
 
 import argparse
+import os
+import numpy as np
 
 from isaaclab.app import AppLauncher
 
@@ -27,13 +29,14 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument("--save_cam_dir", type=str, default=None, help="If set, save table_cam RGB frames to this directory.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
-# launch omniverse app
-app_launcher = AppLauncher(headless=args_cli.headless)
+# launch omniverse app (pass full CLI so flags like --enable_cameras take effect)
+app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 """Rest everything else."""
@@ -269,6 +272,29 @@ def main():
     # reset environment at start
     env.reset()
 
+    # prepare camera saving if requested
+    frame_idx = 0
+    save_cam = args_cli.save_cam_dir is not None
+    if save_cam:
+        os.makedirs(args_cli.save_cam_dir, exist_ok=True)
+
+    def to_uint8_rgb(img):
+        try:
+            import torch as _torch
+
+            if isinstance(img, _torch.Tensor):
+                img = img.detach().to("cpu")
+                if img.dtype.is_floating_point:
+                    img = (img.clamp(0, 1) * 255.0).to(_torch.uint8)
+                img = img.numpy()
+        except Exception:
+            pass
+        if img.dtype != np.uint8:
+            img = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+        if img.shape[-1] == 4:
+            img = img[..., :3]
+        return img
+
     # create action buffers (position + quaternion)
     actions = torch.zeros(env.unwrapped.action_space.shape, device=env.unwrapped.device)
     actions[:, 3] = 1.0
@@ -285,6 +311,26 @@ def main():
         with torch.inference_mode():
             # step environment
             dones = env.step(actions)[-2]
+
+            # optionally capture table_cam after step
+            if save_cam:
+                # ensure sensors updated this frame
+                env.unwrapped.sim.render()
+                table_cam = env.unwrapped.scene.sensors.get("table_cam")
+                if table_cam is not None:
+                    table_rgb = table_cam.data.output.get("rgb", None)
+                    if table_rgb is not None and len(table_rgb) > 0:
+                        img = to_uint8_rgb(table_rgb[0])
+                        out_path = os.path.join(args_cli.save_cam_dir, f"table_{frame_idx:06d}.png")
+                        try:
+                            import imageio.v2 as imageio
+
+                            imageio.imwrite(out_path, img)
+                        except Exception:
+                            from PIL import Image
+
+                            Image.fromarray(img).save(out_path)
+                        frame_idx += 1
 
             # observations
             # -- end-effector frame
